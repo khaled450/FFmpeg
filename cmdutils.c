@@ -1048,7 +1048,7 @@ static void print_program_info(int flags, int level)
     av_log(NULL, level, "%sbuilt on %s %s with %s\n",
            indent, __DATE__, __TIME__, CC_IDENT);
 
-    av_log(NULL, level, "%sconfiguration: " FFMPEG_CONFIGURATION "\n", indent);
+    av_log(NULL, AV_LOG_VERBOSE, "%sconfiguration: " FFMPEG_CONFIGURATION "\n", indent);
 }
 
 void show_banner(int argc, char **argv, const OptionDef *options)
@@ -1058,8 +1058,8 @@ void show_banner(int argc, char **argv, const OptionDef *options)
         return;
 
     print_program_info (INDENT|SHOW_COPYRIGHT, AV_LOG_INFO);
-    print_all_libs_info(INDENT|SHOW_CONFIG,  AV_LOG_INFO);
-    print_all_libs_info(INDENT|SHOW_VERSION, AV_LOG_INFO);
+    print_all_libs_info(INDENT|SHOW_CONFIG,  AV_LOG_VERBOSE);
+    print_all_libs_info(INDENT|SHOW_VERSION, AV_LOG_VERBOSE);
 }
 
 int show_version(void *optctx, const char *opt, const char *arg)
