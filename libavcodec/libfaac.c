@@ -32,6 +32,48 @@
 #include "audio_frame_queue.h"
 #include "internal.h"
 
+#ifndef _WIN32
+#include <dlfcn.h>
+#define LIBEXT "so"
+#else
+#include <windows.h>
+#define LIBEXT "dll"
+#define dlopen(fname, f) ((void *) LoadLibraryA(fname))
+#define dlclose(handle) FreeLibrary((HMODULE) handle)
+#define dlsym(handle, name) GetProcAddress((HMODULE) handle, name)
+#endif
+
+#ifndef FAACAPI
+#define FAACAPI
+#endif
+
+typedef faacEncHandle (FAACAPI *imp_faacEncOpen)(unsigned long, unsigned int numChannels, unsigned long *, unsigned long *);
+typedef int (FAACAPI *imp_faacEncClose)(faacEncHandle);
+typedef int (FAACAPI *imp_faacEncEncode)(faacEncHandle , signed int *, unsigned int, unsigned char *, unsigned int);
+typedef int (FAACAPI *imp_faacEncSetConfiguration)(faacEncHandle, faacEncConfigurationPtr);
+typedef faacEncConfigurationPtr (FAACAPI *imp_faacEncGetCurrentConfiguration)(faacEncHandle);
+typedef int (FAACAPI *imp_faacEncGetDecoderSpecificInfo)(faacEncHandle, unsigned char **, unsigned long *);
+
+typedef struct _faacLib
+{
+    imp_faacEncOpen faacEncOpen;
+    imp_faacEncClose faacEncClose;
+    imp_faacEncEncode faacEncEncode;
+    imp_faacEncSetConfiguration faacEncSetConfiguration;
+    imp_faacEncGetCurrentConfiguration faacEncGetCurrentConfiguration;
+    imp_faacEncGetDecoderSpecificInfo faacEncGetDecoderSpecificInfo;
+} faacLib;
+
+#define DLSYM(x) \
+    do \
+    { \
+        s->pfn.x = ( imp_##x ) dlsym(s->hLib, AV_STRINGIFY(x)); \
+        if (!s->pfn.x ) \
+        { \
+            av_log(avctx, AV_LOG_ERROR, "Unable to find symbol " AV_STRINGIFY(x) " in dynamic libfaac." LIBEXT "\n"); \
+            return -1; \
+        } \
+    } while (0)
 
 /* libfaac has an encoder delay of 1024 samples */
 #define FAAC_DELAY_SAMPLES 1024
@@ -39,6 +81,8 @@
 typedef struct FaacAudioContext {
     faacEncHandle faac_handle;
     AudioFrameQueue afq;
+    void *hLib;
+    faacLib pfn;
 } FaacAudioContext;
 
 static av_cold int Faac_encode_close(AVCodecContext *avctx)
@@ -48,9 +92,10 @@ static av_cold int Faac_encode_close(AVCodecContext *avctx)
     av_freep(&avctx->extradata);
     ff_af_queue_close(&s->afq);
 
-    if (s->faac_handle)
-        faacEncClose(s->faac_handle);
-
+    if (s->hLib && s->faac_handle) {
+        s->pfn.faacEncClose(s->faac_handle);
+        dlclose(s->hLib);
+    }
     return 0;
 }
 
@@ -68,6 +113,18 @@ static av_cold int Faac_encode_init(AVCodecContext *avctx)
     unsigned long samples_input, max_bytes_output;
     int ret;
 
+    if (!(s->hLib = dlopen("libfaac." LIBEXT, RTLD_NOW))) {
+        av_log(avctx, AV_LOG_ERROR, "Unable to load libfaac." LIBEXT "\n");
+        return -1;
+    }
+
+    DLSYM(faacEncOpen);
+    DLSYM(faacEncClose);
+    DLSYM(faacEncEncode);
+    DLSYM(faacEncSetConfiguration);
+    DLSYM(faacEncGetCurrentConfiguration);
+    DLSYM(faacEncGetDecoderSpecificInfo);
+
     /* number of channels */
     if (avctx->channels < 1 || avctx->channels > 6) {
         av_log(avctx, AV_LOG_ERROR, "encoding %d channel(s) is not allowed\n", avctx->channels);
@@ -75,7 +132,7 @@ static av_cold int Faac_encode_init(AVCodecContext *avctx)
         goto error;
     }
 
-    s->faac_handle = faacEncOpen(avctx->sample_rate,
+    s->faac_handle = s->pfn.faacEncOpen(avctx->sample_rate,
                                  avctx->channels,
                                  &samples_input, &max_bytes_output);
     if (!s->faac_handle) {
@@ -85,7 +142,7 @@ static av_cold int Faac_encode_init(AVCodecContext *avctx)
     }
 
     /* check faac version */
-    faac_cfg = faacEncGetCurrentConfiguration(s->faac_handle);
+    faac_cfg = s->pfn.faacEncGetCurrentConfiguration(s->faac_handle);
     if (faac_cfg->version != FAAC_CFG_VERSION) {
         av_log(avctx, AV_LOG_ERROR, "wrong libfaac version (compiled for: %d, using %d)\n", FAAC_CFG_VERSION, faac_cfg->version);
         ret = AVERROR(EINVAL);
@@ -136,7 +193,7 @@ static av_cold int Faac_encode_init(AVCodecContext *avctx)
         unsigned char *buffer = NULL;
         unsigned long decoder_specific_info_size;
 
-        if (!faacEncGetDecoderSpecificInfo(s->faac_handle, &buffer,
+        if (!s->pfn.faacEncGetDecoderSpecificInfo(s->faac_handle, &buffer,
                                            &decoder_specific_info_size)) {
             avctx->extradata = av_malloc(decoder_specific_info_size + FF_INPUT_BUFFER_PADDING_SIZE);
             if (!avctx->extradata) {
@@ -150,11 +207,11 @@ static av_cold int Faac_encode_init(AVCodecContext *avctx)
         free(buffer);
     }
 
-    if (!faacEncSetConfiguration(s->faac_handle, faac_cfg)) {
+    if (!s->pfn.faacEncSetConfiguration(s->faac_handle, faac_cfg)) {
         int i;
         for (i = avctx->bit_rate/1000; i ; i--) {
             faac_cfg->bitRate = 1000*i / avctx->channels;
-            if (faacEncSetConfiguration(s->faac_handle, faac_cfg))
+            if (s->pfn.faacEncSetConfiguration(s->faac_handle, faac_cfg))
                 break;
         }
         if (!i) {
@@ -187,7 +244,7 @@ static int Faac_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     if ((ret = ff_alloc_packet2(avctx, avpkt, (7 + 768) * avctx->channels)) < 0)
         return ret;
 
-    bytes_written = faacEncEncode(s->faac_handle, samples,
+    bytes_written = s->pfn.faacEncEncode(s->faac_handle, samples,
                                   num_samples * avctx->channels,
                                   avpkt->data, avpkt->size);
     if (bytes_written < 0) {
